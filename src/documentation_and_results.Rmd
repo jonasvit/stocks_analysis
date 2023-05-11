@@ -1,0 +1,1007 @@
+---
+title: "Documentation and results"
+author: "Jonas Vitkauskas"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+    toc_collapsed: true
+    number_sections: true
+    start_numbering_level: 2
+toc-title: "Content"
+---
+
+<style type="text/css">
+div.main-container {
+  max-width: 1800px;
+  margin-left: 100px;
+  margin-right: 150px;
+}
+.list-group-item.active, .list-group-item.active:focus, .list-group-item.active:hover {
+    z-index: 2;
+    color: #fff;
+    background-color: #233f53;
+    border-color: #233f53;
+}
+</style>
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE ,warning = FALSE, message = FALSE, fig.width=10, error = TRUE)
+```
+
+```{r, echo = FALSE}
+################################################################################
+### Load packages
+################################################################################
+
+library(RODBC)
+library(data.table)
+library(dplyr)
+library(sqldf)
+library(lubridate)
+library(timeDate)
+library(forecast)
+library(ggplot2)
+library(plotly)
+library(zoo)
+library(writexl)
+library(lubridate)
+library(knitrProgressBar)
+library(parallel)
+library(readxl)
+library(tictoc)
+library(reshape2)
+library(tidyverse)
+library(corrplot)
+library(vars)
+
+library(neuralnet)
+library(MASS)
+library(anytime)
+library(pracma)
+library(TTR)
+library(RcppRoll)
+library(pracma)
+library(rlang)
+library(htmlwidgets)
+library(tibble)
+library(markdown)
+library(rsconnect)
+library(knitr)
+library(stringr)
+library(kableExtra)
+
+
+################################################################################
+### Functions
+################################################################################
+
+
+#' Modify instruments dataframe
+#'
+#' @param df 
+#'
+#' @return Instruments dataframe with date moficiations and a list of all instruments
+#' @export
+#'
+#' @examples modify_instruments(instrument_data)
+modify_instruments <- function(df){
+  
+  # Convert instrument dates to POSIXct format
+  df$date <- anytime(df$date, tz = 'EEST')
+  # Extract only date from the time
+  df$Date_agg <- as.IDate(df$date)
+  
+  # Aggregate instruments by days
+  instruments_daily <- df[, .(open = first(open), # summarizing by taking the first record per group
+                              high = max(high), # summarizing by taking the max value per group
+                              low = min(low), # summarizing by taking the min value per group
+                              close = last(close), # summarizing by taking the last value per group
+                              volume = sum(volume)), # summarizing by summing all values per group
+                          by=list(Date_agg, instrument_id)]
+  # Reorder columns for convenient
+  setcolorder(instruments_daily, c("instrument_id", "Date_agg"))
+  
+  # Overwrite DataFrame with changes
+  assign("instruments_daily", instruments_daily, envir = globalenv())
+  # Write a list of all instruments in the dataframe
+  assign("instruments_list", as.numeric(unique(instruments_daily$instrument_id)), envir = globalenv())
+  
+}
+
+
+#' Create moving average columns
+#'
+#' @param df Dataframe
+#' @param instrument_id Instrument id
+#' @param first_ma A number of days to roll moving average
+#' @param second_ma Another number of days to roll moving average
+#' @param type Type of moving average: 'basic' as classical one, 'e' as exponential
+#' @return Instruments dataframe with moving averages as columns
+#' @export
+#'
+#' @examples moving_avg(instruments_daily, 1001, 12, 26)
+moving_avg <- function(df, instrument_ids, first_ma = 12, second_ma = 26, type = 'e', try_best = TRUE, testing = FALSE){
+  
+  # If optimization function was passed before and only best results are wanted, try_best == TRUE
+  # Current results are already known by running function get_optimal_ma_strategy()
+  if (try_best == TRUE){
+    if (instrument_ids == 1001){
+      first_ma = 4
+      second_ma = 12
+    } else if (instrument_ids == 1002){
+      first_ma = 10
+      second_ma = 12
+    } else if (instrument_ids == 1003){
+      first_ma = 37
+      second_ma = 40
+    } else if (instrument_ids == 1004){
+      first_ma = 16
+      second_ma = 11
+    } else if (instrument_ids == 1005){
+      first_ma = 7
+      second_ma = 9
+    } else if (instrument_ids == 1006){
+      first_ma = 8
+      second_ma = 15
+    } else if (instrument_ids == 1007){
+      first_ma = 12
+      second_ma = 34
+    }
+  }
+  
+  # Get dataframe of one instrument_id
+  df_instrument <- df[instrument_id == instrument_ids, ]
+  
+  # Create column names with specific MA digits
+  ma_name1 <- paste0('moving_avg_',first_ma)
+  ma_name2 <- paste0('moving_avg_',second_ma)
+  
+  # There is two averages considered - moving average and exponential and basic moving average
+  if (type == 'e'){
+    
+    # Create column of first moving average
+    df_instrument[, ma_name1] <- data.table::shift(pracma::movavg(df_instrument$close, n=first_ma, type='e'))
+    df_instrument[2:first_ma, ma_name1] <- NA
+    #data.table::shift(zoo::rollmean(df_instrument$close, k = first_ma, fill = NA))
+    
+    # Create column of second moving average
+    df_instrument[, ma_name2] <- data.table::shift(pracma::movavg(df_instrument$close, n=second_ma, type='e'))
+    df_instrument[2:second_ma, ma_name2] <- NA
+    #data.table::shift(zoo::rollmean(df_instrument$close, k = second_ma, fill = NA))
+    
+  } else if (type == 'basic'){
+    
+    # Create column of first moving average
+    df_instrument[, ma_name1] <- data.table::shift(roll_mean(df_instrument$close, n = first_ma, align = "left", fill = NA, na.rm=TRUE))
+    
+    # Create column of second moving average
+    df_instrument[, ma_name2] <- data.table::shift(roll_mean(df_instrument$close, n = second_ma, align = "left", fill = NA, na.rm=TRUE))
+    
+  } else
+    stop("No such type of moving average. Please try 'e' or 'basic'.")
+  
+  # Create signal column that indicates different MA movings                                                                          ifelse (paste0('moving_avg_',first_ma)<paste0('moving_avg_',second_ma),-1,0)))
+  df_instrument <- df_instrument %>% 
+    mutate("signal" = ifelse(df_instrument[[ma_name1]] > df_instrument[[ma_name2]], 1,
+                             ifelse(df_instrument[[ma_name1]] < df_instrument[[ma_name2]], -1, 0)))
+  
+  #df_instrument <- tail(df_instrument, -max(first_ma,second_ma))
+  
+  # Return dataframe with new variables
+  assign(paste0("df_instrument_",instrument_ids), df_instrument, envir = globalenv())
+  # Return moving average columns in a list
+  assign('ma_columns', list(ma_name1, ma_name2), envir = globalenv())
+  
+  if(try_best == FALSE & testing == TRUE){
+    return(df_instrument)
+  }
+}
+
+
+#' Plot time series for specific stock
+#'
+#' @param df Dataframe that is passed with specific stock information
+#' @param stock_name Stock name
+#'
+#' @return An interactive plot
+#' @export
+#'
+#' @examples plot_instrument(df)
+plot_instrument <- function(df){
+  
+  # Create dummy dataframes with renamed columns for buying and selling points only
+  sell_df <- df[Entry == -2,]
+  colnames(sell_df)[8] = "Short_moving_avg"
+  
+  buy_df <- df[Entry == 2,]
+  colnames(buy_df)[9] = "Long_moving_avg"
+  
+  # Plotting with plot_ly
+  plot <- df %>%
+    plot_ly(x = ~Date_agg, type = "candlestick",
+            open = ~open, close = ~close,
+            high = ~high, low = ~low, name = 'Stocks')
+  plot <- plot %>% add_lines(x = ~Date_agg, y = ~df[[ma_columns[[1]]]], line = list(color = 'blue', width = 0.75),
+                             inherit = F, name = ma_columns[[1]])
+  plot <- plot %>% add_lines(x = ~Date_agg, y = ~df[[ma_columns[[2]]]], line = list(color = 'red', width = 0.75),
+                             inherit = F, name = ma_columns[[2]])
+  plot <- plot %>% 
+    layout(title = paste0('Instrument ', instrument,' price per time period'),
+           legend = list(title=list(text='<b> Variables </b>'),x = 0.1, y = 1, bgcolor = 'rgba(244, 251, 250,0.3)'),
+           plot_bgcolor = "#f4fbfa",
+           xaxis = list(title = 'Date'), 
+           yaxis = list(title = paste(instrument,'instrument price'))
+    )
+  plot <- plot %>%
+    add_trace(data = sell_df, x = ~Date_agg, y = ~Short_moving_avg, type = 'scatter', mode = 'markers',
+              marker = list(
+                color = 'rgb(225, 12, 5)',
+                size = 15,
+                symbol = "triangle-down"
+                ), name = "Sell"
+              )
+  
+  plot <- plot %>%
+    add_trace(data = buy_df,x = ~Date_agg, y = ~Long_moving_avg, type = 'scatter', mode = 'markers',
+              marker = list(
+                color = 'rgb(31, 202, 79)',
+                size = 15,
+                symbol = "triangle-up"
+              ), name = "Buy"
+              )
+  
+  #overview_plots[[paste0('overview_',instrument)]] =  plotly_build(plot)
+  assign(paste0('overview_',instrument), plot, envir = globalenv())
+  
+  return(plot)
+}
+
+
+
+#' Get returns for both total and strategy
+#'
+#' @param df Input dataframe
+#' @param return_name Name of the dataframe
+#'
+#' @return Dataframe with new columns: Total_return, Strategy_returns and Entry
+#' @export
+#'
+#' @examples get_returns(instrument_data)
+# get_returns <- function(df, return_name = as.character(deparse(substitute(df)))){
+#   
+#   # General returns
+#   # df[, 'Total_return':= log(close) - data.table::shift(log(close), fill = NA)]
+#   df[, 'Total_return':= (close/first(close))-1]#(close/data.table::shift(close, fill = NA))-1]
+#   
+#   # Percentage change per day
+#   df[, 'Percentage_change':=(close/data.table::shift(close, fill = NA))-1]
+#   df[, 'strategyxxx':= Percentage_change * signal]
+#   
+#   # Strategies returns
+#   df[, 'Strategy_returns':= signal*Total_return]
+#   
+#   df[, 'Strategy_returns_new':= (1+strategyxxx)*first(close)]
+#   
+#   # Entry
+#   df[, 'Entry':= signal - data.table::shift(signal, fill = NA)]
+#   
+#   # Return dataset with new columns
+#   assign(return_name, df, envir = globalenv())
+#   
+# }
+
+get_returns <- function(df, return_name = as.character(deparse(substitute(df)))){
+  
+  # General returns
+  # df[, 'Total_return':= log(close) - data.table::shift(log(close), fill = NA)]
+  df[, 'Total_return':= (close/first(close))-1]#(close/data.table::shift(close, fill = NA))-1]
+  
+  # Percentage change per day
+  df[, 'Percentage_change':=(close/data.table::shift(close, fill = NA))-1]
+  df[, 'strategyxxx':= Percentage_change * signal]
+  
+  # Strategies returns
+  df[, 'Strategy_returns':= signal*Total_return]
+  
+  df[, 'Strategy_returns_new':= (1+strategyxxx)*first(close)]
+  
+  # Entry
+  df[, 'Entry':= signal - data.table::shift(signal, fill = NA)]
+  
+  # Return dataset with new columns
+  assign(return_name, df, envir = globalenv())
+  
+}
+
+#' Get cumulative sums for both total and strategy returns. This way of calculating cumulative sums
+#' was considered after spending plenty of time by trying to make functions like cumsum() work.
+#'
+#' @param df Input dataframe
+#' @param testing Logical variable if the function is used for getting optimal MAs or not.
+#'
+#' @return Instruments dataframe with date moficiations and a list of all instruments
+#' @export
+#'
+#' @examples get_returns(instrument_data)
+get_cumsums <- function(df, testing = FALSE){
+  
+  df$Date_agg <- as.character(df$Date_agg)
+  # df <- sqldf('
+  #     with lenta as (Select *,
+  #            Sum(Total_return) Over ( Order by Date_agg ) As Total_return_cumsum,
+  #            Sum(Strategy_returns) Over ( Order by Date_agg ) As Strategy_return_cumsum
+  #    from df)
+  #    select *,
+  #       exp(Total_return_cumsum) as Total_return_cumsum,
+  #       exp(Strategy_return_cumsum) as Strategy_return_cumsum
+  #    from lenta
+  #     ')
+  
+  df <- sqldf('
+      with lenta as (Select *,
+             Total_return as exp_return_cumsum,
+             Strategy_returns_new as exp_str_return_cumsum
+     from df)
+     select *,
+        exp_return_cumsum as Total_return_cumsum,
+        exp_str_return_cumsum as Strategy_return_cumsum
+     from lenta
+      ')
+  
+  df$Date_agg <- as.Date(df$Date_agg)
+  assign('testukas', df, envir = globalenv())
+  if(testing==TRUE){
+    df <- tail(df$Strategy_return_cumsum,1)
+  }
+  
+  return(df)
+  
+}
+
+
+#' Plot returns comparing Buy/Hold and system strategies
+#'
+#' @param df Dataframe that is passed with specific stock information
+#'
+#' @return An interactive plot
+#' @export
+#'
+#' @examples plot_returns(df)
+plot_returns <- function(df){
+  
+  #df1 <- get_cumsums(df)
+  
+  # Plotting with plot_ly
+  plot <- plot_ly(df, x = ~Date_agg, y = ~Total_return, name = 'Total return', type = 'scatter', mode = 'lines', color = I("#233f53")) %>% 
+    layout(title = paste('Returns for',instrument,'per time period'),
+           legend = list(title=list(text='<b> Variables </b>'),x = 0.1, y = 1, bgcolor = 'rgba(244, 251, 250,0.3)'),
+           plot_bgcolor = "#f4fbfa",
+           xaxis = list(title = 'Date'), 
+           yaxis = list(title = paste(instrument,'instrument price'))
+    )
+  plot <- plot %>% add_trace(y = ~Strategy_returns, name = 'Strategy returns', mode = 'lines',color = I("#d33c13"))
+  
+  #return_plots[[paste0('returns_',instrument)]] <-  plot
+  assign(paste0('returns_',instrument), plot, envir = globalenv())
+  
+  return(plot)
+}
+
+
+#' Function that outputs optimal MA values to perform on specific instrument. Input is taken from global env.
+#'
+#' @param max_iterations Max number of iterations to run different moving averages through. Starting point is 2.
+#'
+#' @return An interactive plot
+#' @export
+#'
+#' @examples get_optimal_ma_stategy()
+get_optimal_ma_stategy <- function(start_with = 5, max_iterations = 40, instrument = 1007){
+  
+  if(max_iterations < 5){
+    stop('The number has to be at least 3.')
+  } else {
+    for (first in start_with:max_iterations){
+      for (second in (start_with+1):max_iterations){
+        
+        if(first != second){
+          df <- moving_avg(instruments_daily, instrument, first_ma = first, second_ma = second, type = 'e', try_best = FALSE, testing = TRUE)
+          df <- get_returns_new(df, paste0('df_instrument_',instrument), testing = TRUE)
+        }
+        
+        if (first == start_with & second ==start_with+1){
+          dt = data.table(first_maa = first,
+                          second_maa = second,
+                          Strategy_returns = 0)
+        } else {
+          print(paste0(first," and ",second))
+          dt1 = data.table(first_maa = first,
+                           second_maa = second,
+                           Strategy_returns = as.numeric(tail(df[!is.na(df$Strategy_returns),'Strategy_returns'],1)))
+          dt = rbind(dt,dt1)
+        }
+        
+      }
+    }
+  }
+  
+  assign('all_values', dt, envir = globalenv())
+  
+  return(print(dt %>% filter(Strategy_returns == max(Strategy_returns))))
+  
+}
+
+
+
+get_returns_new <- function(df, return_name = as.character(deparse(substitute(df))), total_portfolio = 1000,
+                            percent_portfolio_to_invest = 0.05, testing = FALSE){
+  
+  # Entry
+  df[, 'Entry':= signal - data.table::shift(signal, fill = NA)]
+  
+  na_entry <- sum(is.na(df$signal))+1
+  df[1:na_entry, 'Entry'] <- 0
+  
+  
+  first_entrance_value_row <- first(which(df$Entry == 2, arr.ind=TRUE))
+  
+  strategy_df <- data.table(Investment_from = as.Date(df$Date_agg[first_entrance_value_row]),
+                            Total_portfolio = total_portfolio,
+                            Investment_percent = percent_portfolio_to_invest,
+                            investment_money = total_portfolio*percent_portfolio_to_invest,
+                            total_saved = NA)
+  
+  df[1:first_entrance_value_row-1, 'Entry'] <- NA
+  strat_row <- 1
+  
+  for (row in first_entrance_value_row:nrow(df)){
+    
+    if(df$Entry[row] == 2 & df$signal[row] == 1 & row != nrow(df)){
+      
+      df[row,'Invest_or_take'] <- strategy_df$investment_money[strat_row]
+      
+    } else if (df$Entry[row] == 0){
+      
+      if(row == first_entrance_value_row+1){
+        
+        df[row, 'Invest_or_take'] <- df$Invest_or_take[row-1] * df$close[row] / df$close[row-1]
+        
+      } else {
+        
+        if (df$signal[row-1] == 1 & row != nrow(df)){
+          
+          df[row, 'Invest_or_take'] <- df$Invest_or_take[row-1] * df$close[row] / df$close[row-1]
+          
+        } else if (row != nrow(df)){
+          
+          df[row, 'Invest_or_take'] <- NA
+          
+        } else if (row == nrow(df) & df$signal[row] == 1){
+          
+          strategy_df[strat_row, 'total_saved'] <- df$Invest_or_take[row]
+          
+          df[row, 'Invest_or_take'] <- df$Invest_or_take[row-1] * df$close[row] / df$close[row-1]
+          strategy_df <- transform(strategy_df, total_saved = as.numeric(total_saved))
+          strategy_df[strat_row, 'total_saved'] <- df$Invest_or_take[row]
+          strat_row <- strat_row + 1
+          strategy_row <- data.table(Investment_from = as.Date(df$Date_agg[row]),
+                                     Total_portfolio = strategy_df$Total_portfolio[strat_row-1] + df$Invest_or_take[row]-strategy_df$investment_money[strat_row-1],
+                                     Investment_percent = percent_portfolio_to_invest,
+                                     investment_money = 0,
+                                     total_saved = NA)
+          strategy_row <- transform(strategy_row, total_saved = as.numeric(total_saved))
+          strategy_df <- rbind(strategy_df, strategy_row)
+          
+        }
+        
+      }
+      
+    } else if (df$Entry[row] == -2){
+      
+      df[row, 'Invest_or_take'] <- df$Invest_or_take[row-1] * df$close[row] / df$close[row-1]
+      strategy_df <- transform(strategy_df, total_saved = as.numeric(total_saved))
+      strategy_df[strat_row, 'total_saved'] <- df$Invest_or_take[row]
+      strat_row <- strat_row + 1
+      strategy_row <- data.table(Investment_from = as.Date(df$Date_agg[row]),
+                                 Total_portfolio = strategy_df$Total_portfolio[strat_row-1] + df$Invest_or_take[row]-strategy_df$investment_money[strat_row-1],
+                                 Investment_percent = percent_portfolio_to_invest,
+                                 investment_money = percent_portfolio_to_invest* (strategy_df$Total_portfolio[strat_row-1] + df$Invest_or_take[row]-strategy_df$investment_money[strat_row-1]),
+                                 total_saved = NA)
+      strategy_row <- transform(strategy_row, total_saved = as.numeric(total_saved))
+      strategy_df <- rbind(strategy_df, strategy_row)
+      
+    } else stop('yo')
+  }
+  
+  strategy_df$Strategy_returns <- strategy_df$Total_portfolio-total_portfolio
+  
+  df[first_entrance_value_row:nrow(df), 'Total_return_growth':= (close/df$close[first_entrance_value_row])-1]
+  df[first_entrance_value_row, 'Total_return'] = total_portfolio*percent_portfolio_to_invest
+  df[, 'Total_return'] = total_portfolio*percent_portfolio_to_invest*(1+df$Total_return_growth)
+  
+  setnames(df, "Invest_or_take", "Strategy_returns")
+  
+  df <- df[order(rank(Date_agg))]
+  
+  assign(return_name, df, envir = globalenv())
+  
+  if (testing == TRUE){
+    assign(paste0('strategy_',str_sub(return_name,-4,-1)), strategy_df, envir = globalenv())
+  }
+}
+
+
+```
+
+```{r, echo = FALSE}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+instrument_data <- fread("../input/instrument_data.csv", header = T)
+modify_instruments(instrument_data)
+```
+
+# Code overview
+
+One of the strategies that was considered was **exponential moving average (EMA)**. It is one of the most basic strategies to implement, thus the results are not the best to expect to get. A moving average (MA) is a widely used technical indicator that smooths out price trends by filtering out the noise from random short-term price fluctuations. It is important to note that moving average strategy is mostly beneficial for short-term time series and the ones that do not have drastic increases/decreases over the time. In the results you will see that this method is nothing to compare to total returns for some instruments.
+
+## Definitions and investment from portfolio strategy
+
++ `Total returns` -- a measure of the performance of an asset, usually a share or bond, over a period of time. It indicates the amount of money that could be saved starting from investment date for some period of time with no strategies included.
++ `Strategy returns` -- a measure of the performance of an asset, usually a share or bond, over a period of time with a specific strategy.
+
+In our case, we are assuming that for each instrument 5% of total portfolio (\$1000 in the beginning) is being invested every time when the strategy tells to invest. It is a safe strategy to not lose all money by investing all of the gained amount. Example: you invest \$50 on 2012-01-01 when strategy says to invest. Then on 2012-03-01 the strategy shows that money need to be pulled out with the growth of \$70 (\$20 gained). Since our portfolio was \$1000, now we have \$1020. The next time when strategy says to invest, we are investing another 5% from the total portfolio (\$1020 this time) which is \$51 and continue the same procedure.
+
+Another better scenario (not coded) is to take out not the whole amount of money but 10% and invest 30% when the time comes. There are many different ways to deal with investments.
+
+Please note that in this solution the total portfolio was used for every instrument. To get optimal portfolio split for all instruments it require a lot more time to think of different ways to split the amount and monitor its returns, especially when we have different time series for instruments here.
+
+## Understanding the code structure
+
+The code is written in a very common coding manner:
+
++ `000_run.R` -- file that should be run to get results, plots and best fits for MA strategy.
++ `01_setup.R` -- libraries that need to be loaded. There are extra libraries since the starting idea was to use neural networks and more advanced statistics but ended up implementing simpler strategy.
++ `02_functions.R` -- functions that are used to create MA strategy.
++ `03_strategies.R` -- a script where functions are called in the correct order with the correct data.
++ `04_best_strategy.R` -- a script where optimal moving averages could be found. This script should be run one to get optimal MAs. Since the assignment was done pretty fast, function that is looking for optimal points is very slow due to nested for loops. In order to get better experience, function should be rewritten. On the other hand, if a function `get_returns_new` is optimized, running time should increase significantly.
++ `documentation_and_results.Rmd` -- an overview of the strategy selected, code logic and results presented.
+
+
+Please note that most of the data frame manipulations are done with `data.table` package instead of `base` or `dplyr` to optimize the running time as much as possible.
+
+## Data aggregation
+
+The data set is aggregated per instrument daily with the logic for columns as follows:
+
++ `open` -- taking the first record of the day;
++ `high` -- taking the max record of the day;
++ `low` -- taking the min record of the day;
++ `close` -- taking the last record of the day;
++ `volume` -- summing all records per day.
+
+
+# Results
+
+Here are going to be presented results for each instrument.
+
+For each instrument the first graph represents trends of the instrument using candle sticks (turn it off to get a smoother view by pressing 'Stocks' in the Variables section), selected optimal moving averages for short period of time and Buy/Sell points for our strategy. Second graph represents returns for the total period of time since the first investment of our total portfolio (\$1000 as mentioned before). Note that the final number does not represent what is the total saved money is. It indicates how our strategy performs in a graphical manner. Please see the tables below at the last number of `Strategy_returns` to see the number that is saved.
+
+The gaps between Strategy returns in the second graph is intended to be shown, it is because in the gaps between when strategy says to invest and when it is time to take the money out there is nothing happening with our money because we took all of it out.
+
+Simply saying, the higher the Strategy returns line is, the more money we gain. If the red line is over the blue one, it means that our strategy works better than total returns strategy.
+
+Moreover, please not that there was taken a short term moving averages optimization function. The amount of iteration for each instrument was taken 40 days. For very poorly performing instruments an additional graph is presented what would happen if we would choose long term moving averages (instruments 1004, 1005, 1006).
+
+## Instrument 1001
+
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[2]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 4, 12, type = 'e')
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+  
+}
+```
+
+```{r, echo = FALSE}
+# Plot instrument overview with strategy
+plot_instrument(get(df_name))
+```
+
+```{r, echo = FALSE}
+plot_returns(get(df_name))
+#overview_1006
+```
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[2]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = TRUE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name, testing = TRUE)
+}
+```
+
+```{r echo = FALSE, results = 'asis'}
+kbl(strategy_1001) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  scroll_box(width = "950px", height = "300px")
+```
+
++ Total returns with no strategy = `r round(last(df_instrument_1001$Total_return)-50,2)`\$.
++ Total returns with strategy = `r round(last(strategy_1001$Strategy),2)`\$.
+
+## Instrument 1002
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[3]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 4, 12, type = 'e')
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+  
+}
+```
+
+```{r, echo = FALSE}
+# Plot instrument overview with strategy
+plot_instrument(get(df_name))
+```
+
+```{r, echo = FALSE}
+plot_returns(get(df_name))
+#overview_1006
+```
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[3]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = TRUE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name, testing = TRUE)
+}
+```
+
+```{r echo = FALSE, results = 'asis'}
+kbl(strategy_1002) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  scroll_box(width = "950px", height = "300px")
+```
+
++ Total returns with no strategy = `r round(last(df_instrument_1002$Total_return)-50,2)`\$.
++ Total returns with strategy = `r round(last(strategy_1002$Strategy),2)`\$.
+
+## Instrument 1003
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[4]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 4, 12, type = 'e')
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+  
+}
+```
+
+```{r, echo = FALSE}
+# Plot instrument overview with strategy
+plot_instrument(get(df_name))
+```
+
+```{r, echo = FALSE}
+plot_returns(get(df_name))
+#overview_1006
+```
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[4]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = TRUE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name, testing = TRUE)
+}
+```
+
+```{r echo = FALSE, results = 'asis'}
+kbl(strategy_1003) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  scroll_box(width = "950px", height = "300px")
+```
+
++ Total returns with no strategy = `r round(last(df_instrument_1003$Total_return)-50,2)`\$.
++ Total returns with strategy = `r round(last(strategy_1003$Strategy))`\$.
+
+## Instrument 1004
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[5]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 4, 12, type = 'e')
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+  
+}
+```
+
+```{r, echo = FALSE}
+# Plot instrument overview with strategy
+plot_instrument(get(df_name))
+```
+
+```{r, echo = FALSE}
+plot_returns(get(df_name))
+#overview_1006
+```
+
+Additional graph: better strategy performance with longer moving averages. MA1 = 147, MA2 = 300 days.
+```{r, echo = FALSE}
+for (instrument in instruments_list[5]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = FALSE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+}
+
+plot_returns(get(df_name))
+```
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[5]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = TRUE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name, testing = TRUE)
+}
+```
+
+```{r echo = FALSE, results = 'asis'}
+kbl(strategy_1004) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  scroll_box(width = "950px", height = "300px")
+```
+
++ Total returns with no strategy = `r round(last(df_instrument_1004$Total_return)-50,2)`\$.
++ Total returns with strategy = `r round(last(strategy_1004$Strategy),2)`\$.
+
+
+## Instrument 1005
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[6]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 4, 12, type = 'e')
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+  
+}
+```
+
+```{r, echo = FALSE}
+# Plot instrument overview with strategy
+plot_instrument(get(df_name))
+```
+
+```{r, echo = FALSE}
+plot_returns(get(df_name))
+#overview_1006
+```
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[6]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = TRUE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name, testing = TRUE)
+}
+```
+
+Additional graph: better strategy performance with longer moving averages. MA1 = 147, MA2 = 300 days.
+```{r, echo = FALSE}
+for (instrument in instruments_list[6]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = FALSE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+}
+
+plot_returns(get(df_name))
+```
+
+```{r echo = FALSE, results = 'asis'}
+kbl(strategy_1005) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  scroll_box(width = "950px", height = "300px")
+```
+
++ Total returns with no strategy = `r round(last(df_instrument_1005$Total_return)-50,2)`\$.
++ Total returns with strategy = `r round(last(strategy_1005$Strategy),2)`\$.
+
+## Instrument 1006
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[7]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 4, 12, type = 'e')
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+  
+}
+```
+
+```{r, echo = FALSE}
+# Plot instrument overview with strategy
+plot_instrument(get(df_name))
+```
+
+```{r, echo = FALSE}
+plot_returns(get(df_name))
+#overview_1006
+```
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[7]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = TRUE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name, testing = TRUE)
+}
+```
+
+Additional graph: better strategy performance with longer moving averages. MA1 = 147, MA2 = 300 days.
+```{r, echo = FALSE}
+for (instrument in instruments_list[7]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = FALSE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+}
+
+plot_returns(get(df_name))
+```
+
+```{r echo = FALSE, results = 'asis'}
+kbl(strategy_1006) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  scroll_box(width = "950px", height = "300px")
+```
+
++ Total returns with no strategy = `r round(last(df_instrument_1006$Total_return)-50,2)`\$.
++ Total returns with strategy = `r round(last(strategy_1006$Strategy),2)`\$.
+
+## Instrument 1007
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[1]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 4, 12, type = 'e')
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name)
+  
+}
+```
+
+```{r, echo = FALSE}
+# Plot instrument overview with strategy
+plot_instrument(get(df_name))
+```
+
+```{r, echo = FALSE}
+plot_returns(get(df_name))
+#overview_1006
+```
+
+```{r, echo = FALSE}
+for (instrument in instruments_list[1]){
+  
+  # Create dummy dataframe name on which the model is running
+  df_name <- paste0('df_instrument_',instrument)
+  
+  # Create MAs
+  moving_avg(instruments_daily, instrument, 147, 300, type = 'e', try_best = TRUE)
+  
+  # Get total and strategies returns
+  get_returns_new(get(df_name), df_name, testing = TRUE)
+}
+```
+
+```{r echo = FALSE, results = 'asis'}
+kbl(strategy_1007) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  scroll_box(width = "950px", height = "300px")
+```
+
++ Total returns with no strategy = `r round(last(df_instrument_1007$Total_return)-50,2)`\$.
++ Total returns with strategy = `r round(last(strategy_1007$Strategy),2)`\$.
+
+
+
+# Some comments on results
+
+By using EMA strategy, strategy returns are performing better than total returns on instruments that do not fluctuate a lot and are not drastically growing/shrinking. It is clear that MA strategy works on short-term investments only.
+
+In order to generate better techniques for the whole portfolio, it is important to get the track from a specific date for all instruments at the same time. Then it is possible to work with the portfolio as desired. At this time, we have not looked at the general view, how one instrument's strategy impacts the other ones and so on.
